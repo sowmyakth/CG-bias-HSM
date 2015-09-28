@@ -1,2 +1,3 @@
-# work
-# Stuff to do
+# Simple exercise
+To measure shear bias using moments for simple galaxy profiles
+
