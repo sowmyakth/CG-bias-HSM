@@ -7,6 +7,10 @@ measured by either HSM module in GalSim or direct momemtsvcalculation without
 PSF correction.
 
 Implementation is for Euclid (as used in Semboloni 2013) and LSST parameters.
+
+Notes:
+calc_cg_new is either faster or same as calc_cg.
+REGAUSS  is slower than KSB
 """
 
 import galsim
@@ -14,6 +18,8 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.utils.console import ProgressBar
+from lmfit import minimize,Parameters#, report_fit, report_errors,fit_report
+
 
 def make_Euclid_filter(res=1.0):
     """ Make a Euclid-like filter (eye-balling Semboloni++13).
@@ -34,7 +40,7 @@ def get_LSST_filter(filter_name='r'):
     @return               galsim.Bandpass object. 
     """
 
-    datapath = os.getcwd()+'/data'
+    datapath = os.getcwd()+'/data/'
     filter_filename = datapath+'LSST_{}.dat'.format(filter_name)
     filter_bandpass = galsim.Bandpass(filter_filename).thin(rel_err=1e-4)
     return filter_bandpass
@@ -155,6 +161,45 @@ def get_moments(array):
     Qxy = np.sum(array*(x-xbar)*(y-ybar))/denom
     return Qxx, Qyy, Qxy
 
+def fcn2min(params,data,Args,psf):
+    """Function given as input to lmfit, to compute residual of fit and true
+    galaxy (galaxy with no CG)
+    @param params  fit parameters
+    @param data    true data
+    @param Args
+    @param mod_psf psf
+    @returns difference betwwen fit and true"""
+    g1 = params['g1'].value       #shear of galaxy
+    g2 = params['g2'].value       #shear of galaxy
+    rb = params['rb'].value       #half light radius of buldge
+    rd = params['rd'].value       #half light radius disk
+    bf = params['bf'].value     #ratio Flux of buldge to total flux
+
+    mod_bulge = galsim.Sersic(n=Args.bulge_n, half_light_radius=rb,
+                              flux=Args.T_flux * bf)
+    mod_disk = galsim.Sersic(n=Args.disk_n, half_light_radius=rd,
+                                     flux=Args.T_flux * (1 - bf))
+    mod_gal = ((mod_bulge + mod_disk)*Args.c_SED).shear(g1=g1, g2=g2)
+    obj_con = galsim.Convolve(mod_gal, psf)
+    mod_im = (obj_con.drawImage(bandpass=Args.bp, scale=Args.scale,
+                                nx=Args.npix, ny=Args.npix)).array
+    model1 = mod_im.flatten()
+    resid = model1 - data
+    return resid
+
+def param_in(Args):
+    """To make sure every fit gets the same initial params.Else multiple runs take parameters of previous fit
+    @param   params   parameters class for fit
+    @returns parameters with preset values""" 
+    d=(1 + 0.001*np.random.random())
+    params = Parameters()
+    params.add('g1', value=(Args.rt_g[0][0])*d, vary=True, min=-1., max=1.)
+    params.add('g2', value=(Args.rt_g[0][1])*d, vary=True, min=-1.,max=1.)
+    params.add('rb', value=Args.bulge_HLR*d, vary=True, min=0.,max=3.)
+    params.add('rd', value=Args.disk_HLR*d, vary=True, min=0., max=3.)
+    params.add('bf', value=Args.bulge_frac*d, vary=True, min=0, max=1.)
+    return params
+
 def estimate_shape(Args, gal_img, PSF_img, method):
     """ Estimate the shape (ellipticity) of a galaxy. 
 
@@ -196,8 +241,21 @@ def estimate_shape(Args, gal_img, PSF_img, method):
             	                              hsmparams = new_params)
         else:
             #Weight size is not given; HSM calculates the appropriate weight
-            result = galsim.hsm.EstimateShear(gal_img, PSF_img, shear_est=method)
+            new_params = galsim.hsm.HSMParams(nsig_rg=200, nsig_rg2=200,
+                                              max_moment_nsig2=40000)
+            result = galsim.hsm.EstimateShear(gal_img, PSF_img, shear_est=method,
+                                              hsmparams = new_params)
         shape = galsim.Shear(g1=result.corrected_g1, g2=result.corrected_g2)
+    elif method == 'fit':
+        params = param_in(Args)
+        data = (gal_img.array).flatten()
+        fit_kws = {'maxfev':1000,'ftol':1.49012e-38,'xtol':1.49012e-38,}
+        chr_psf = get_PSF(Args)
+        result = minimize(fcn2min,params,args=(data, Args, chr_psf), **fit_kws)
+        print 'chisqr,rb,rd,b_frac',result.chisqr,params['rb'].value,params['rd'].value,params['mb_T'].value 
+        print 'g1,g2',params['g1'].value,params['g2'].value
+        shape = galsim.Shear(g1=params['g1'].value,g2=params['g2'].value)
+        #print result.fit_report
     return shape
 
 def cg_ring_test(Args, gal_cg, gal_nocg, chr_PSF):
@@ -243,6 +301,7 @@ def cg_ring_test(Args, gal_cg, gal_nocg, chr_PSF):
             ghat_nocg[i] = [ehat_nocg.g1, ehat_nocg.g2]
             bar.update()
     return ghat_cg.T,ghat_nocg.T
+
 
 
 def getFWHM(image):
@@ -331,7 +390,7 @@ class Eu_Args():
         self.T_flux=1.
         self.rt_g=rt_g
 
-class Lsst_Args():
+class LSST_Args():
     """Class containing input parameters for LSST
     @npix    Number of pixels across postage stamp image.
     @scale  Pixel scale of postage stamp image.
@@ -348,28 +407,28 @@ class Lsst_Args():
     @disk_HLR      Half-light-radius of the disk.
     @disk_e        Shape of disk [e1, e2].
     """
-    def __init__(self,npix=360,scale=0.2,
-                 psf_sigma_o=1.648,psf_w_o=550,
+    def __init__(self,npix=360, scale=0.2,
+                 psf_sigma_o=0.297, psf_w_o=550,
                  alpha=-0.2, redshift=0.3,
-                 sig_w=0.8,shear_est='REGAUSS',                 
-                 disk_n=1.0,bulge_n=1.5,
-                 disk_e=[0.0,0.0],bulge_e=[0.0,0.0],
-                 bulge_HLR=0.3,disk_HLR=0.8,
-                 bulge_frac=0.25,n_ring=3,
-                 rt_g=[[0.01,0.01]]):
-        self.telescope='LSST'
-        self.npix=npix
-        self.scale=scale
-        self.psf_sigma_o=psf_sigma
-        self.psf_w_o=psf_w_o
-        self.bulge_HLR=bulge_HLR
-        self.disk_HLR=disk_HLR
-        self.redshift=redshift
-        self.bulge_n=bulge_n
-        self.disk_n=disk_n
-        self.bulge_e=bulge_e
-        self.disk_e=disk_e
-        self.bulge_frac=bulge_frac
+                 sig_w=0.8, shear_est='REGAUSS',                 
+                 disk_n=1.0, bulge_n=1.5,
+                 disk_e=[0.0, 0.0], bulge_e=[0.0, 0.0],
+                 bulge_HLR=0.17, disk_HLR=1.2,
+                 bulge_frac=0.25, n_ring=3,
+                 rt_g=[[0.01,0.01]], filter_name='r' ):
+        self.telescope ='LSST'
+        self.npix = npix
+        self.scale = scale
+        self.psf_sigma_o = psf_sigma_o
+        self.psf_w_o = psf_w_o
+        self.bulge_HLR = bulge_HLR
+        self.disk_HLR = disk_HLR
+        self.redshift = redshift
+        self.bulge_n = bulge_n
+        self.disk_n = disk_n
+        self.bulge_e = bulge_e
+        self.disk_e = disk_e
+        self.bulge_frac = bulge_frac
         self.disk_SED_name='Sbc'
         self.bulge_SED_name='E'
         self.b_SED=None
@@ -380,7 +439,8 @@ class Lsst_Args():
         self.shear_est=shear_est
         self.n_ring=n_ring
         self.alpha=alpha
-        self.res=res
+        self.filter_name = filter_name
+
         self.T_flux=1.
         self.rt_g=rt_g
 
@@ -402,7 +462,7 @@ def calc_cg(Args, calc_weight=False):
     if Args.telescope is 'Euclid':
         Args.bp = make_Euclid_filter(Args.res)
     elif Args.telescope is 'LSST': 
-        Args.bp = get_LSST_filter()
+        Args.bp = get_LSST_filter(Args.filter_name)
     chr_psf = get_PSF(Args)
     gal_cg = get_gal_cg(Args)
     gal_nocg = get_gal_nocg(Args, gal_cg, chr_psf)
@@ -453,7 +513,6 @@ def new_cSED(Args, psf, sig_wp ):
     dnmtr = (gal_im.array*weight_im.array).sum()
     new_bf = nmtr/dnmtr    
     c_SED = Args.b_SED * new_bf + Args.d_SED * (1. - new_bf)
-    print 'New b frac',new_bf, 'max_weight', np.amax(weight_im.array)
     return new_bf,c_SED
 
 def cg_shape_wp(Args, sig_wp, calc_weight=False):
@@ -472,11 +531,11 @@ def cg_shape_wp(Args, sig_wp, calc_weight=False):
         Args.sig_w      For S13 method, the width (sigma) of the Gaussian weight funcion.
     @return New bulge fraction computed with photo weight function.
     @return Shape of galaxy with CG, shape of galaxy with no CG."""
-    Args.b_SED,Args.d_SED,Args.c_SED= get_SEDs(Args)
+    Args.b_SED,Args.d_SED,Args.c_SED = get_SEDs(Args)
     if Args.telescope is 'Euclid':
         Args.bp  = make_Euclid_filter(Args.res)
     elif Args.telescope is 'LSST': 
-        Args.bp = get_LSST_filter()
+        Args.bp = get_LSST_filter(Args.filter_name)
     chr_psf = get_PSF(Args)
     gal_cg = get_gal_cg(Args)
     gal_nocg = get_gal_nocg(Args, gal_cg, chr_psf)
@@ -485,7 +544,130 @@ def cg_shape_wp(Args, sig_wp, calc_weight=False):
         im1 = con_cg.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale )
         Args.sig_w = getHLR(im1.array)*Args.scale
     new_bf, Args.c_SED = new_cSED(Args, chr_psf, sig_wp)
-    return [new_bf, calc_cg(Args)]
+    return [new_bf, cg_ring_test(Args, gal_cg, gal_nocg, chr_psf)]
+
+#!!!! Alterante to cg_ringtest
+
+def ring_test_single_gal(Args, gal, chr_PSF):
+    """ Ring test to measure shape of galaxy.
+    @param Args         Class with the following attributes:
+        Args.npix       Number of pixels across postage stamp image
+        Args.scale      Pixel scale of postage stamp image
+        Args.n_ring     Number of intrinsic ellipticity pairs around ring.
+        Args.shear_est  Method to use to estimate shape.
+        Args.sig_w      For S13 method, the width (sigma) of the Gaussian 
+                        weight funcion.
+    @return  Multiplicate bias estimate.
+
+    !!! Need to correct ehat
+    """
+    star = galsim.Gaussian(half_light_radius=1e-9)*Args.c_SED
+    con = galsim.Convolve(chr_PSF,star)
+    PSF_img = con.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale)
+    n = len(Args.rt_g) 
+    ghat = np.zeros([n,2])
+    T = n*Args.n_ring*2
+    with ProgressBar(T) as bar:
+        for i,g in enumerate(Args.rt_g):
+            gsum = []
+            betas = np.linspace(0.0, 360.0, 2*Args.n_ring, endpoint=False)/2.
+            for beta in betas:
+                gal1 = gal.rotate(beta*galsim.degrees).shear(g1=g[0], g2=g[1])
+                obj = galsim.Convolve(gal1, chr_PSF)
+                img = obj.drawImage(bandpass=Args.bp,
+                                    nx=Args.npix, ny=Args.npix,
+                                    scale=Args.scale)
+                result   = estimate_shape(Args, img, PSF_img, Args.shear_est)
+                gsum.append([result.g1, result.g2])
+            gmean = np.mean(np.array(gsum), axis=0)
+            ghat[i]   = [gmean[0], gmean[1]]
+    return ghat.T
+
+def calc_cg_new(Args, calc_weight=False):
+    """Compute shape of galaxy with CG and galaxy with no CG 
+    @param Args         Class with the following attributes:
+        Args.telescope  Telescope the CG bias of which is to be meaasured
+                        (Euclid or LSST)
+        Args.bp         GalSim Bandpass describing filter.
+        Args.b_SED      SED of bulge.
+        Args.d_SED      SED of disk.
+        Args.c_SED      Flux weighted composite SED.
+        Args.scale      Pixel scale of postage stamp image.
+        Args.n_ring     Number of intrinsic ellipticity pairs around ring.
+        Args.shear_est  Method to use to estimate shape.  See `estimate_shape` docstring.
+        Args.sig_w      For S13 method, the width (sigma) of the Gaussian weight funcion.
+    @return  Shape of galaxy with CG, shape of galaxy with no CG ."""
+    Args.b_SED,Args.d_SED,Args.c_SED = get_SEDs(Args)
+    if Args.telescope is 'Euclid':
+        Args.bp = make_Euclid_filter(Args.res)
+    elif Args.telescope is 'LSST': 
+        Args.bp = get_LSST_filter(Args.filter_name)
+    chr_psf = get_PSF(Args)
+    gal_cg = get_gal_cg(Args)
+    gal_nocg = get_gal_nocg(Args, gal_cg, chr_psf)
+    #compute HLR of galaxy with CG and set it as the size of the weight function
+    if calc_weight is True:
+        con_cg = (galsim.Convolve(gal_cg,chr_psf))
+        im1 = con_cg.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale )
+        Args.sig_w = (getHLR(im1.array)*Args.scale)
+    g_cg = ring_test_single_gal(Args, gal_cg, chr_psf)
+    g_ncg = ring_test_single_gal(Args, gal_nocg, chr_psf)
+    return g_cg, g_ncg
+
+def calc_shape_galcg(Args, calc_weight=False):
+    """Compute shape of galaxy with CG only.
+    @param Args         Class with the following attributes:
+        Args.telescope  Telescope the CG bias of which is to be meaasured
+                        (Euclid or LSST)
+        Args.bp         GalSim Bandpass describing filter.
+        Args.b_SED      SED of bulge.
+        Args.d_SED      SED of disk.
+        Args.c_SED      Flux weighted composite SED.
+        Args.scale      Pixel scale of postage stamp image.
+        Args.n_ring     Number of intrinsic ellipticity pairs around ring.
+        Args.shear_est  Method to use to estimate shape.  See `estimate_shape` docstring.
+        Args.sig_w      For S13 method, the width (sigma) of the Gaussian weight funcion.
+    @return  Shape of galaxy with CG, shape of galaxy with no CG ."""
+    Args.b_SED,Args.d_SED,Args.c_SED= get_SEDs(Args)
+    if Args.telescope is 'Euclid':
+        Args.bp = make_Euclid_filter(Args.res)
+    elif Args.telescope is 'LSST': 
+        Args.bp = get_LSST_filter(Args.filter_name)
+    chr_psf = get_PSF(Args)
+    gal_cg = get_gal_cg(Args)
+    g_cg = ring_test_single_gal(Args, gal_cg, chr_psf)
+    return g_cg
+
+def calc_shape_galnocg(Args, calc_weight=False):
+    """Compute shape of galaxy with no CG only.
+    @param Args         Class with the following attributes:
+        Args.telescope  Telescope the CG bias of which is to be meaasured
+                        (Euclid or LSST)
+        Args.bp         GalSim Bandpass describing filter.
+        Args.b_SED      SED of bulge.
+        Args.d_SED      SED of disk.
+        Args.c_SED      Flux weighted composite SED.
+        Args.scale      Pixel scale of postage stamp image.
+        Args.n_ring     Number of intrinsic ellipticity pairs around ring.
+        Args.shear_est  Method to use to estimate shape.  See `estimate_shape` docstring.
+        Args.sig_w      For S13 method, the width (sigma) of the Gaussian weight funcion.
+    @return  Shape of galaxy with CG, shape of galaxy with no CG ."""
+    Args.b_SED,Args.d_SED,Args.c_SED= get_SEDs(Args)
+    if Args.telescope is 'Euclid':
+        Args.bp = make_Euclid_filter(Args.res)
+    elif Args.telescope is 'LSST': 
+        Args.bp = get_LSST_filter(Args.filter_name)
+    chr_psf = get_PSF(Args)
+    gal_cg = get_gal_cg(Args)
+    gal_nocg = get_gal_nocg(Args, gal_cg, chr_psf)
+    #compute HLR of galaxy with CG and set it as the size of the weight function
+    if calc_weight is True:
+        con_cg = (galsim.Convolve(gal_cg,chr_psf))
+        im1 = con_cg.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale )
+        Args.sig_w = (getHLR(im1.array)*Args.scale)
+    g_ncg = ring_test_single_gal(Args, gal_nocg, chr_psf)
+    return g_ncg
+
 
 
 
