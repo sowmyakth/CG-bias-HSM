@@ -18,7 +18,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.utils.console import ProgressBar
-from lmfit import minimize,Parameters#, report_fit, report_errors,fit_report
+from lmfit import minimize, Parameters, report_fit, report_errors,fit_report
 
 
 def make_Euclid_filter(res=1.0):
@@ -179,7 +179,8 @@ def fcn2min(params,data,Args,psf):
                               flux=Args.T_flux * bf)
     mod_disk = galsim.Sersic(n=Args.disk_n, half_light_radius=rd,
                                      flux=Args.T_flux * (1 - bf))
-    mod_gal = ((mod_bulge + mod_disk)*Args.c_SED).shear(g1=g1, g2=g2)
+    mod_gal = (mod_bulge + mod_disk)*Args.c_SED
+    mod_gal = mod_gal.shear(g1=g1, g2=g2)
     obj_con = galsim.Convolve(mod_gal, psf)
     mod_im = (obj_con.drawImage(bandpass=Args.bp, scale=Args.scale,
                                 nx=Args.npix, ny=Args.npix)).array
@@ -191,10 +192,10 @@ def param_in(Args):
     """To make sure every fit gets the same initial params.Else multiple runs take parameters of previous fit
     @param   params   parameters class for fit
     @returns parameters with preset values""" 
-    d=(1 + 0.001*np.random.random())
+    d=(1 + 0.1*np.random.random())
     params = Parameters()
-    params.add('g1', value=(Args.rt_g[0][0])*d, vary=True, min=-1., max=1.)
-    params.add('g2', value=(Args.rt_g[0][1])*d, vary=True, min=-1.,max=1.)
+    params.add('g1', value=0.1, vary=True, min=-1., max=1.)
+    params.add('g2', value=0.1, vary=True, min=-1.,max=1.)
     params.add('rb', value=Args.bulge_HLR*d, vary=True, min=0.,max=3.)
     params.add('rd', value=Args.disk_HLR*d, vary=True, min=0., max=3.)
     params.add('bf', value=Args.bulge_frac*d, vary=True, min=0, max=1.)
@@ -251,11 +252,15 @@ def estimate_shape(Args, gal_img, PSF_img, method):
         data = (gal_img.array).flatten()
         fit_kws = {'maxfev':1000,'ftol':1.49012e-38,'xtol':1.49012e-38,}
         chr_psf = get_PSF(Args)
-        result = minimize(fcn2min,params,args=(data, Args, chr_psf), **fit_kws)
-        print 'chisqr,rb,rd,b_frac',result.chisqr,params['rb'].value,params['rd'].value,params['mb_T'].value 
-        print 'g1,g2',params['g1'].value,params['g2'].value
-        shape = galsim.Shear(g1=params['g1'].value,g2=params['g2'].value)
-        #print result.fit_report
+        result = minimize(fcn2min, params ,args=(data, Args, chr_psf), **fit_kws)
+        #print 'chisqr',result.chisqr
+        #print ('rb, rd, b_frac', result.params['rb'].value, 
+               #result.params['rd'].value, 
+               #result.params['bf'].value )
+        #print 'g1,g2', result.params['g1'].value, result.params['g2'].value
+        shape = galsim.Shear(g1=result.params['g1'].value,
+                             g2=result.params['g2'].value)
+        #print fit_report(result)
     return shape
 
 def cg_ring_test(Args, gal_cg, gal_nocg, chr_PSF):
@@ -471,6 +476,7 @@ def calc_cg(Args, calc_weight=False):
         con_cg = (galsim.Convolve(gal_cg,chr_psf))
         im1 = con_cg.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale )
         Args.sig_w = (getHLR(im1.array)*Args.scale)
+        print 'HLR for redshift={0} is {1}'.format(Args.redshift, Args.sig_w)
     return cg_ring_test(Args, gal_cg, gal_nocg, chr_psf)
 
 
@@ -610,6 +616,7 @@ def calc_cg_new(Args, calc_weight=False):
         con_cg = (galsim.Convolve(gal_cg,chr_psf))
         im1 = con_cg.drawImage(Args.bp, nx=Args.npix, ny=Args.npix, scale=Args.scale )
         Args.sig_w = (getHLR(im1.array)*Args.scale)
+        print 'Sigma of weight fn:', Args.sig_w
     g_cg = ring_test_single_gal(Args, gal_cg, chr_psf)
     g_ncg = ring_test_single_gal(Args, gal_nocg, chr_psf)
     return g_cg, g_ncg
